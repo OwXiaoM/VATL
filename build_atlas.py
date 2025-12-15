@@ -110,7 +110,10 @@ class AtlasBuilder:
         # --------- Start Actual Validation ---------
         if (epoch_train+1) % self.args['validate_every'] == 0 or (epoch_train+1) == self.args['epochs']['train']:
             # Evaluate reconstruction quality on training subjects specified by idcs_df
-            metrics_train = self.generate_subjects_from_df(idcs_df=[0, 2, 3], epoch=epoch_train, split='train')
+            
+            num_train = len(self.datasets['train'])
+            train_indices = [0, 2, 3] if num_train > 3 else list(range(num_train)) 
+            metrics_train = self.generate_subjects_from_df(idcs_df=train_indices, epoch=epoch_train, split='train')
             log_metrics(self.args, metrics_train, epoch_train, df=self.datasets['train'].df, split='train')
 
             # Evaluate reconstruction quality on validation subjects

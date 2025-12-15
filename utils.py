@@ -495,10 +495,14 @@ def mask_nifti(nii, mask):
 
 def compute_metrics(args, pred, affine, df_row_dict, epoch, split, reg_type='Rigid', bg_label=None):
     """
-    Compute metrics for a predicted subject. 
-    MODIFIED: Skips registration (assumes pred and ref are already aligned in physical space).
+    Compute metrics for a predicted subject.
+    MODIFIED: 
+    1. Skips registration (assumes pred and ref are aligned in world coordinates).
+    2. RESAMPLES prediction to reference geometry to handle different grid sizes (fixes Dimension Mismatch).
     """
     import ants
+    import numpy as np
+    import nibabel as nib
     
     pred, affine = typecheck_img_affine(pred, affine)
     metrics = {'Subject': df_row_dict['subject_id'], 'PSNR': [], 'SSIM': [], 'DICE': []}
@@ -510,76 +514,83 @@ def compute_metrics(args, pred, affine, df_row_dict, epoch, split, reg_type='Rig
     else:
         bg_label = 0 # default background label
 
-    # (可选) 加载 Mask 用于可能的逻辑，但此处不再用于配准
-    if 'Seg' in modalities[-1] or 'Mask' in modalities[-1]:
-        mask_ref_nii = nib.load(df_row_dict[modalities[-1]])
-    else:
-        mask_ref_nii = None
-        # print("No segmentation/mask provided." )
-    
-    # mytx = None # 不再需要变换矩阵传递
-
     for i, mod in enumerate(modalities):
-        # 兼容 'Seg' 和 'Mask' 命名
+        # 判断当前是否为分割模态 (Seg 或 Mask)
         is_seg = (i == len(modalities)-1 and ('Seg' in mod or 'Mask' in mod))
         
-        # 加载参考图像 (GT)
+        # 1. 加载 Reference (GT) -> 这是目标几何形状 (Native Space)
         mod_ref_nii = nib.load(df_row_dict[mod])
-        # 加载预测图像
+        
+        # 2. 加载 Prediction (Model Output) -> 这是源几何形状 (Standard Space, e.g., 600x600x600)
         mod_pred_nii = nib.Nifti1Image(pred[..., i], affine)
 
-        # ================== [修改核心：跳过配准，直接归一化] ==================
-        fix = ants.from_nibabel(mod_ref_nii)
-        mov = ants.from_nibabel(mod_pred_nii)
-        
+        # 3. 转换为 ANTs 对象以便处理
+        fix = ants.from_nibabel(mod_ref_nii) # Fixed Image (GT)
+        mov = ants.from_nibabel(mod_pred_nii) # Moving Image (Pred)
+
+        # ================= [关键修复：重采样] =================
+        # 即使物理坐标对齐，像素网格可能不同。必须将 Mov 重采样到 Fix 的网格上。
+        try:
+            # 分割图使用最近邻插值 (genericLabel)，连续图像使用线性插值 (linear)
+            interp_type = 'genericLabel' if is_seg else 'linear'
+            
+            # 执行重采样：把 Prediction 变成和 GT 一样的形状
+            mov = ants.resample_image_to_target(mov, fix, interp_type=interp_type)
+        except Exception as e:
+            print(f"[Error] Resampling failed for {mod}: {e}. Skipping metric.")
+            continue
+        # ====================================================
+
+        # 4. 归一化 (仅针对非分割图像，如 MRA)
+        # 确保 PSNR/SSIM 计算在 [0, 1] 范围内
         if not is_seg:
-             # 对于 MRA/Intensity 图像，进行 Min-Max 归一化到 [0, 1]
-             # 这是为了让 PSNR 和 SSIM 计算有意义
              mov_arr = mov.numpy()
              fix_arr = fix.numpy()
              
-             # 归一化预测图 (Pred)
+             # 归一化 Prediction
              if mov_arr.max() - mov_arr.min() > 1e-6:
                  mov = (mov - mov_arr.min()) / (mov_arr.max() - mov_arr.min())
              
-             # 归一化参考图 (GT) - 确保对比在同一尺度
+             # 归一化 Reference (GT) - 保证两者对比尺度一致
              if fix_arr.max() - fix_arr.min() > 1e-6:
                  fix = (fix - fix_arr.min()) / (fix_arr.max() - fix_arr.min())
 
-        # 将处理后的 ANTs 对象转回 nibabel，用于后续的 crop 和 metric 计算
+        # 5. 转回 Nibabel 用于裁剪和指标计算
         mod_pred_reg_nii = ants.to_nibabel(mov)
-        mod_ref_nii = ants.to_nibabel(fix) # 注意：这里我们也更新了 ref (因为可能做了归一化)
+        mod_ref_nii = ants.to_nibabel(fix)
         
-        # ====================================================================
-
-        # crop imgs to avoid background from boosting the metrics
-        # 获取 GT 的非零区域 bbox
-        bbox, _ = get_bbox(mod_ref_nii) # 使用修改后的 get_bbox 以防全黑
+        # 6. 裁剪 (Crop) 以去除背景，聚焦脑部区域计算指标
+        # 使用你修改过的 get_bbox (带防空检查)
+        bbox, _ = get_bbox(mod_ref_nii) 
         
         x_min, y_min, z_min = bbox[0]
         x_max, y_max, z_max = bbox[1]+1
         
-        # 裁剪数据
+        # 这里的 getData() 已经是重采样后的，形状完全匹配，不会再报 Dimension Mismatch
         mod_pred_reg_cropped = mod_pred_reg_nii.get_fdata()[x_min:x_max, y_min:y_max, z_min:z_max]
         mod_ref_cropped = mod_ref_nii.get_fdata()[x_min:x_max, y_min:y_max, z_min:z_max]
         
-        # 计算指标
+        # 7. 计算指标
         if not is_seg:
-            metrics['PSNR'].append(psnr_metric(mod_pred_reg_cropped, mod_ref_cropped))
-            metrics['SSIM'].append(ssim_metric(mod_pred_reg_cropped, mod_ref_cropped, data_range=1))
+            metrics['PSNR'].append(psnr_metric(mod_pred_reg_cropped, mod_ref_cropped, data_range=1.0))
+            metrics['SSIM'].append(ssim_metric(mod_pred_reg_cropped, mod_ref_cropped, data_range=1.0))
         else:
             metrics['DICE'].append(compute_dice(mod_pred_reg_cropped, mod_ref_cropped, bg_label))
         
-        # 保存图像 (训练过程中用于监控)
+        # 8. 保存图像 (可选)
         if args['save_imgs'][split]:
             fn_pred = f'{split}/{mod}_{sub_id}_ep={epoch}.nii.gz'
             fn_ref = f'{split}/{mod}_{sub_id}_ref.nii.gz'
-            # 保存裁剪前的完整图像
-            save_img(mod_pred_reg_nii.get_fdata(), affine, args['output_dir'], fn_pred)
-            save_img(mod_ref_nii.get_fdata(), affine, args['output_dir'], fn_ref)
+            
+            # 保存完整图像 (未裁剪)
+            # 注意：这里保存的是重采样后的 Prediction，它现在和 GT 形状一样
+            save_img(mod_pred_reg_nii.get_fdata(), mod_pred_reg_nii.affine, args['output_dir'], fn_pred)
+            
+            # 同时也保存一下处理后的 Reference (可能被归一化过)
+            save_img(mod_ref_nii.get_fdata(), mod_ref_nii.affine, args['output_dir'], fn_ref)
 
     return metrics
-
+    
 def reg_imgs(fix_nii, mov_nii, mask_mov_nii=None, mytx=None, reg_type='Rigid', is_seg=False):
     """
     Normalizes, masks, and registers a moving image to a fixed image.

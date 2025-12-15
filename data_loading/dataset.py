@@ -80,21 +80,82 @@ class Data(Dataset):
         
         return modalities
 
+    # def load_coords_and_values(self, modalities, normalize=True):
+    #     modalities_data = self.augment_modalities(modalities)
+    #     last_mod = modalities_data[self.modality_keys[-1]] # last modality is segmentation
+    #     affine = modalities[self.modality_keys[-1]].affine
+    #     c_nz = np.argwhere(last_mod > 0)
+    #     values = np.stack([modalities_data[mod][c_nz[:, 0], c_nz[:, 1], c_nz[:, 2]].flatten() 
+    #                           for mod in self.modality_keys], axis=-1)
+    #     c_nz = nib.affines.apply_affine(affine, c_nz)
+    #     center_of_mass = np.mean(c_nz, axis=0)
+    #     coords = c_nz - center_of_mass # center the image in voxel space
+    #     if normalize:
+    #         wb_center = self.world_bbox / 2
+    #         coords = (coords / wb_center) # normalize to [-1, 1]
+    #         assert_correct_coord_normalization(coords) # check coordinates are normed to [-1, 1]  
+    #         values = normalize_intensities(values, self.args['dataset']['normalize_values'])
+    #     return coords, values
+
     def load_coords_and_values(self, modalities, normalize=True):
         modalities_data = self.augment_modalities(modalities)
-        last_mod = modalities_data[self.modality_keys[-1]] # last modality is segmentation
+        
+        # 获取 MRA 和 Mask 数据
+        # 假设 modalities[0] 是 MRA, modalities[-1] 是 Seg
+        mra_data = modalities_data[self.modality_keys[0]]
+        seg_data = modalities_data[self.modality_keys[-1]]
+        
+        # 1. 找到所有血管点 (前景)
+        # 这些点非常宝贵，全部保留
+        vessel_indices = np.argwhere(seg_data > 0)
+        
+        # 2. 找到背景点候选集 (MRA有值 但 Seg为0)
+        # 使用 > 1e-3 过滤掉纯空气背景，只保留脑组织背景
+        bg_indices_all = np.argwhere((mra_data > 1e-3) & (seg_data == 0))
+        
+        # 3. [关键步骤] 对背景点进行随机降采样
+        # 策略：保持 正负样本比例为 1:2 (即背景点是血管点的2倍)
+        # 这样既能让网络学会背景，又不会导致数据量爆炸
+        n_vessel = len(vessel_indices)
+        n_bg_total = len(bg_indices_all)
+        
+        # 设定背景点目标数量 (例如血管点的 2 倍，且设定一个上限防止显存溢出)
+        target_n_bg = int(n_vessel * 2) 
+        
+        # 安全检查：如果血管点太少（比如切片层），至少采一些背景
+        target_n_bg = max(target_n_bg, 10000) 
+        
+        if n_bg_total > target_n_bg:
+            # 随机选择 (无放回)
+            # 使用 permutation 比 choice 对大数组更快
+            perm = np.random.permutation(n_bg_total)
+            selected_bg_indices = bg_indices_all[perm[:target_n_bg]]
+        else:
+            selected_bg_indices = bg_indices_all
+
+        # 4. 合并血管点和采样后的背景点
+        c_nz = np.vstack((vessel_indices, selected_bg_indices))
+        
+        # --- 以下逻辑保持不变 ---
+        
+        # 获取仿射矩阵
         affine = modalities[self.modality_keys[-1]].affine
-        c_nz = np.argwhere(last_mod > 0)
+
+        # 提取值
         values = np.stack([modalities_data[mod][c_nz[:, 0], c_nz[:, 1], c_nz[:, 2]].flatten() 
                               for mod in self.modality_keys], axis=-1)
+        
+        # 转换坐标
         c_nz = nib.affines.apply_affine(affine, c_nz)
         center_of_mass = np.mean(c_nz, axis=0)
-        coords = c_nz - center_of_mass # center the image in voxel space
+        coords = c_nz - center_of_mass 
+        
         if normalize:
             wb_center = self.world_bbox / 2
-            coords = (coords / wb_center) # normalize to [-1, 1]
-            assert_correct_coord_normalization(coords) # check coordinates are normed to [-1, 1]  
+            coords = (coords / wb_center) 
+            assert_correct_coord_normalization(coords) 
             values = normalize_intensities(values, self.args['dataset']['normalize_values'])
+            
         return coords, values
     
     def augment_modalities(self, modalities):

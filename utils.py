@@ -235,18 +235,37 @@ def generate_combinations(args_data, conditions, keys=None, idx=0, current=None,
 def generate_world_grid(args, normed=True, device='cpu'):
     world_bbox = args['dataset']['world_bbox']
     spacing = args['atlas_gen']['spacing']
+    
+    # 1. 生成网格点
     x = torch.arange(0, world_bbox[0], spacing[0], device=device)
     y = torch.arange(0, world_bbox[1], spacing[1], device=device)
     z = torch.arange(0, world_bbox[2], spacing[2], device=device)
+    
+    # 2. 归一化 (用于喂给网络)
     if normed:
         # normalize to [-1, 1]
         x = x / world_bbox[0] * 2 - 1
         y = y / world_bbox[1] * 2 - 1
         z = z / world_bbox[2] * 2 - 1
+        
     grid = torch.meshgrid(x, y, z, indexing='ij')
     grid_shape = list(grid[0].shape)
     grid_coords = torch.stack(grid, dim=-1).reshape(-1, 3)
+    
+    # 3. [关键修改] 构建 Affine 矩阵
+    # 原代码: affine = torch.diag(torch.tensor([spacing[0], ... 1.0])) -> 原点在 0
+    # 修改后: 将原点(Translation) 设为 -world_bbox / 2
+    # 这样生成的 NIfTI 图像的物理中心就是 (0,0,0)
+    
     affine = torch.diag(torch.tensor([spacing[0], spacing[1], spacing[2], 1.0], device=device))
+    
+    # 计算原点偏移量: origin = - (world_bbox / 2)
+    # 注意：这里假设 voxel (0,0,0) 对应的物理坐标应该是 bbox 的左上角负半区
+    origin_offset = -torch.tensor(world_bbox, device=device) / 2.0
+    
+    # 将偏移量填入 Affine 矩阵的最后一列 (前三行)
+    affine[:3, 3] = origin_offset
+
     return grid_coords, grid_shape, affine
 
 

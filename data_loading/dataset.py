@@ -96,68 +96,61 @@ class Data(Dataset):
     #         assert_correct_coord_normalization(coords) # check coordinates are normed to [-1, 1]  
     #         values = normalize_intensities(values, self.args['dataset']['normalize_values'])
     #     return coords, values
-
     def load_coords_and_values(self, modalities, normalize=True):
-        modalities_data = self.augment_modalities(modalities)
-        
-        # 获取 MRA 和 Mask 数据
-        # 假设 modalities[0] 是 MRA, modalities[-1] 是 Seg
-        mra_data = modalities_data[self.modality_keys[0]]
-        seg_data = modalities_data[self.modality_keys[-1]]
-        
-        # 1. 找到所有血管点 (前景)
-        # 这些点非常宝贵，全部保留
-        vessel_indices = np.argwhere(seg_data > 0)
-        
-        # 2. 找到背景点候选集 (MRA有值 但 Seg为0)
-        # 使用 > 1e-3 过滤掉纯空气背景，只保留脑组织背景
-        bg_indices_all = np.argwhere((mra_data > 1e-3) & (seg_data == 0))
-        
-        # 3. [关键步骤] 对背景点进行随机降采样
-        # 策略：保持 正负样本比例为 1:2 (即背景点是血管点的2倍)
-        # 这样既能让网络学会背景，又不会导致数据量爆炸
-        n_vessel = len(vessel_indices)
-        n_bg_total = len(bg_indices_all)
-        
-        # 设定背景点目标数量 (例如血管点的 2 倍，且设定一个上限防止显存溢出)
-        target_n_bg = int(n_vessel * 2) 
-        
-        # 安全检查：如果血管点太少（比如切片层），至少采一些背景
-        target_n_bg = max(target_n_bg, 10000) 
-        
-        if n_bg_total > target_n_bg:
-            # 随机选择 (无放回)
-            # 使用 permutation 比 choice 对大数组更快
-            perm = np.random.permutation(n_bg_total)
-            selected_bg_indices = bg_indices_all[perm[:target_n_bg]]
-        else:
-            selected_bg_indices = bg_indices_all
+            modalities_data = self.augment_modalities(modalities)
+            mra_data = modalities_data[self.modality_keys[0]]
+            seg_data = modalities_data[self.modality_keys[-1]]
+            affine = modalities[self.modality_keys[-1]].affine
 
-        # 4. 合并血管点和采样后的背景点
-        c_nz = np.vstack((vessel_indices, selected_bg_indices))
-        
-        # --- 以下逻辑保持不变 ---
-        
-        # 获取仿射矩阵
-        affine = modalities[self.modality_keys[-1]].affine
-
-        # 提取值
-        values = np.stack([modalities_data[mod][c_nz[:, 0], c_nz[:, 1], c_nz[:, 2]].flatten() 
-                              for mod in self.modality_keys], axis=-1)
-        
-        # 转换坐标
-        c_nz = nib.affines.apply_affine(affine, c_nz)
-        center_of_mass = np.mean(c_nz, axis=0)
-        coords = c_nz - center_of_mass 
-        
-        if normalize:
-            wb_center = self.world_bbox / 2
-            coords = (coords / wb_center) 
-            assert_correct_coord_normalization(coords) 
-            values = normalize_intensities(values, self.args['dataset']['normalize_values'])
+            # 1. 找到所有血管点 (前景)
+            vessel_indices = np.argwhere(seg_data > 0)
             
-        return coords, values
-    
+            # === [关键修复 1]：先计算稳定的质心 ===
+            # 无论后续怎么采样背景，这个质心永远固定在血管结构的中心
+            if len(vessel_indices) > 0:
+                vessel_phys = nib.affines.apply_affine(affine, vessel_indices)
+                stable_center_of_mass = np.mean(vessel_phys, axis=0)
+            else:
+                # 如果没有血管(极端情况)，回退到图像中心
+                img_center_idx = np.array(mra_data.shape) / 2.0
+                stable_center_of_mass = nib.affines.apply_affine(affine, img_center_idx)
+
+            # 2. 找到背景点候选集
+            bg_indices_all = np.argwhere((mra_data > 1e-3) & (seg_data == 0))
+            
+            # 3. 随机降采样背景 (保持 1:2 比例)
+            n_vessel = len(vessel_indices)
+            target_n_bg = int(n_vessel * 2) 
+            target_n_bg = max(target_n_bg, 10000) 
+            
+            if len(bg_indices_all) > target_n_bg:
+                perm = np.random.permutation(len(bg_indices_all))
+                selected_bg_indices = bg_indices_all[perm[:target_n_bg]]
+            else:
+                selected_bg_indices = bg_indices_all
+
+            # 4. 合并所有点
+            c_nz = np.vstack((vessel_indices, selected_bg_indices))
+            
+            # 提取值
+            values = np.stack([modalities_data[mod][c_nz[:, 0], c_nz[:, 1], c_nz[:, 2]].flatten() 
+                                for mod in self.modality_keys], axis=-1)
+            
+            # 5. 转换坐标
+            c_nz_phys = nib.affines.apply_affine(affine, c_nz)
+            
+            # === [关键修复 2]：使用稳定的质心进行中心化 ===
+            # 不要重新计算 mean，直接用上面算好的 stable_center_of_mass
+            coords = c_nz_phys - stable_center_of_mass 
+            
+            if normalize:
+                wb_center = self.world_bbox / 2
+                coords = (coords / wb_center) 
+                assert_correct_coord_normalization(coords) 
+                values = normalize_intensities(values, self.args['dataset']['normalize_values'])
+                
+            return coords, values
+            
     def augment_modalities(self, modalities):
         if self.data_augmentation:
             tio_sub = {}
